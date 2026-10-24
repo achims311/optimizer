@@ -125,6 +125,87 @@ paths:
               example:
                 message: "Optimization failed: Infeasible problem"
 
+  /optimize/explain:
+    post:
+      tags:
+        - optimization
+      summary: Explain an optimizer plan
+      description: |
+        Explains in plain language why a plan looks the way it does. The request and the plan are rendered
+        as a text table, one row per step, and handed to a chat model together with a description of the
+        optimization model.
+
+        The endpoint is only available where the service is configured with a chat model.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExplainInput"
+      responses:
+        "200":
+          description: The explanation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExplainResult"
+        "400":
+          description: Bad request - request or plan missing or malformed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "502":
+          description: The chat model could not be asked
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Explanations are not configured on this service
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /optimize/explain/feedback:
+    post:
+      tags:
+        - optimization
+      summary: Vote on an explanation
+      description: |
+        Stores a thumbs up or down and an optional comment together with the plan and the explanation
+        /optimize/explain gave for it, to improve the prompt. Nothing is stored until a user votes.
+
+        The endpoint is only available where the service is configured with a feedback store.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExplainFeedback"
+      responses:
+        "200":
+          description: The vote was stored
+        "400":
+          description: Bad request - plan, explanation or vote missing or malformed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "502":
+          description: The feedback store could not be reached
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Feedback is not configured on this service
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /optimize/health:
     get:
       tags:
@@ -153,12 +234,14 @@ components:
       properties:
         charging_strategy:
           type: string
-          enum: [none, charge_before_export, attenuate_grid_peaks]
+          enum: [none, charge_before_export, attenuate_demand_peaks, attenuate_feedin_peaks, attenuate_grid_peaks]
           description: |
             Sets a strategy for charging in situations where choices are cost neutral.
             - none (default): no strategy set 
             - charge_before_export: charge batteries before exporting to grid
-            - attenuate_grid_peaks: charge at times with high solar yield to reduce the grid load
+            - attenuate_demand_peaks: level the grid import profile, charging at partial power over several time steps instead of one peak
+            - attenuate_feedin_peaks: level the grid export profile, charging to shave solar feed-in peaks
+            - attenuate_grid_peaks: level both the grid import and the grid export profile
         discharging_strategy:
           type: string
           enum: [none, discharge_before_import]
@@ -238,7 +321,16 @@ components:
           type: number
           minimum: 0
           description: Maximum charge power in W
-          example: 11000 
+          example: 11000
+        c_active:
+          type: boolean
+          default: false
+          description: |
+            Whether the device is charging at the start of the time horizon.
+              - True: the device enters the horizon switched on, so keeping it on costs no charge
+                start and interrupting it costs one.
+              - False: (default) the device is idle and any charging starts a new session.
+          example: true
         d_max:
           type: number
           minimum: 0
@@ -392,10 +484,14 @@ components:
       properties:
         status:
           type: string
-          enum: [Optimal, Infeasible, Unbounded, Undefined, Not Solved]
+          enum: [Optimal, Feasible, Infeasible, Unbounded, Undefined, Not Solved]
           description: |
             Optimization solver status:
-            - Optimal: Problem solved to optimality
+            - Optimal: Problem solved to proven optimality
+            - Feasible: A schedule was found but the solver stopped before proving it optimal,
+              normally because it reached OPTIMIZER_TIME_LIMIT. The response carries a complete,
+              usable schedule, the same shape as Optimal; it is simply not proved to be the best
+              one. Treat it as usable.
             - Infeasible: No feasible solution exists
             - Unbounded: Objective function is unbounded
             - Undefined: Problem status is undefined
@@ -404,7 +500,9 @@ components:
         objective_value:
           type: number
           nullable: true
-          description: Optimal objective function value (economic benefit in currency units). Null if not optimal.
+          description: |
+            Objective function value (economic benefit in currency units). Present for Optimal and
+            Feasible, null otherwise.
           example: 1250.75
         limit_violations:
           type: object
@@ -453,6 +551,77 @@ components:
             minimum: 0
           description: Energy not exported due to hitting the grid export power limit at each time step (Wh)
           example: [0, 0, 1000, 10, 0, 0]
+
+    ExplainInput:
+      type: object
+      required:
+        - req
+        - res
+      properties:
+        req:
+          $ref: "#/components/schemas/OptimizationInput"
+          description: The request the plan was computed from
+        res:
+          $ref: "#/components/schemas/OptimizationResult"
+          description: The plan returned for it
+        details:
+          type: object
+          description: Request details as evcc publishes them in its state, a timestamp per step and batteryDetails with title, type and capacity per battery
+          properties:
+            timestamp:
+              type: array
+              items:
+                type: string
+                format: date-time
+            batteryDetails:
+              type: array
+              items:
+                type: object
+                properties:
+                  name:
+                    type: string
+                  title:
+                    type: string
+                  type:
+                    type: string
+                  capacity:
+                    type: number
+                    description: kWh
+        currency:
+          type: string
+          description: Currency of the prices
+          default: EUR
+        language:
+          type: string
+          description: Language of the explanation as an IETF tag
+          default: en
+          example: de
+
+    ExplainResult:
+      type: object
+      properties:
+        explanation:
+          type: string
+          description: Explanation of the plan, markdown
+
+    ExplainFeedback:
+      allOf:
+        - $ref: "#/components/schemas/ExplainInput"
+        - type: object
+          required:
+            - explanation
+            - vote
+          properties:
+            explanation:
+              type: string
+              description: The explanation as returned by /optimize/explain
+            vote:
+              type: string
+              enum: [up, down]
+              description: Whether the explanation helped
+            comment:
+              type: string
+              description: What was wrong or missing, optional
 
     Error:
       type: object

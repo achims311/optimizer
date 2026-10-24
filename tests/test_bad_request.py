@@ -1,0 +1,181 @@
+import json
+from unittest.mock import ANY
+
+import pytest
+
+from optimizer.app import app
+
+
+@pytest.fixture
+def payload():
+    return {
+        'batteries': [{
+            's_min': 0, 's_max': 10000, 's_initial': 5000,
+            'c_min': 0, 'c_max': 5000, 'd_max': 0, 'p_a': 0.0001,
+        }],
+        'time_series': {
+            'dt': [3600, 3600], 'gt': [1000, 1000], 'ft': [0, 0],
+            'p_N': [0.0003, 0.0003], 'p_E': [0.0001, 0.0001],
+        },
+    }
+
+
+@pytest.mark.parametrize('body', ['', '{', 'private-invalid-body'])
+def test_malformed_json_returns_400(body, capsys):
+    response = app.test_client().post('/optimize/charge-schedule', data=body, content_type='application/json')
+
+    assert response.status_code == 400
+    assert response.json['message']
+    logged = capsys.readouterr().out
+    assert json.loads(logged)['bad_request'] == {
+        'path': '/optimize/charge-schedule',
+        'client': ANY,
+        'reason': 'Invalid request body',
+        'fields': [],
+        'validator': None,
+    }
+    assert 'private-invalid-body' not in logged
+
+
+def test_missing_fields_are_logged(capsys):
+    response = app.test_client().post('/optimize/charge-schedule', json={})
+
+    assert response.status_code == 400
+    assert set(response.json['details']) == {'batteries', 'time_series'}
+    assert 'errors' not in response.json
+    assert json.loads(capsys.readouterr().out)['bad_request'] == {
+        'path': '/optimize/charge-schedule',
+        'client': ANY,
+        'reason': 'Input payload validation failed',
+        'fields': ['batteries', 'time_series'],
+        'validator': 'required',
+    }
+
+
+@pytest.mark.parametrize('validator', ['enum', 'type'])
+def test_validation_logs_omit_request_values(payload, validator, capsys):
+    secret = 'private-request-value'
+    if validator == 'enum':
+        payload['strategy'] = {'charging_strategy': secret}
+        field = 'strategy.charging_strategy'
+    else:
+        payload['batteries'][0]['c_min'] = secret
+        field = 'batteries.0.c_min'
+
+    response = app.test_client().post('/optimize/charge-schedule?token=private-query', json=payload,
+                                      headers={'Authorization': 'Bearer private-token'})
+
+    assert response.status_code == 400
+    assert secret in json.dumps(response.json['details'])
+    logged = capsys.readouterr().out
+    assert 'private-' not in logged
+    assert json.loads(logged)['bad_request'] == {
+        'path': '/optimize/charge-schedule',
+        'client': ANY,
+        'reason': 'Input payload validation failed',
+        'fields': [field],
+        'validator': validator,
+    }
+
+
+@pytest.mark.parametrize('series', ['p_N', 'dt'])
+def test_length_mismatch_names_the_series(payload, series, capsys):
+    payload['time_series'][series] = payload['time_series'][series][:1]
+    payload['batteries'][0]['s_goal'] = [0, 5000]
+
+    response = app.test_client().post('/optimize/charge-schedule', json=payload)
+
+    assert response.status_code == 400
+    lengths = {'dt': 2, 'gt': 2, 'ft': 2, 'p_N': 2, 'p_E': 2, 'p_demand': [], 's_goal': [2]}
+    lengths[series] = 1
+    assert response.json == {'message': 'All time series must have the same length', 'lengths': lengths}
+    assert json.loads(capsys.readouterr().out)['bad_request'] == {
+        'path': '/optimize/charge-schedule',
+        'client': ANY,
+        'reason': 'All time series must have the same length',
+        'fields': [],
+        'validator': None,
+        'lengths': lengths,
+    }
+
+
+def test_empty_time_series_is_rejected(payload):
+    # an empty horizon used to reach the model and come back as a 500 from np.min over no prices
+    for series in payload['time_series']:
+        payload['time_series'][series] = []
+
+    response = app.test_client().post('/optimize/charge-schedule', json=payload)
+
+    assert response.status_code == 400
+    assert response.json['message'] == 'Time series must not be empty'
+
+
+def test_client_version_is_logged(payload, capsys):
+    payload['time_series']['p_N'] = [0.0003]
+
+    app.test_client().post('/optimize/charge-schedule', json=payload, headers={'User-Agent': 'evcc/0.308.1'})
+
+    assert json.loads(capsys.readouterr().out)['bad_request']['client'] == 'evcc/0.308.1'
+
+
+@pytest.mark.parametrize('field', ['c_min', 'c_max', 'd_max', 's_min', 's_max', 's_initial', 's_capacity'])
+def test_negative_limit_names_the_field(payload, field, capsys):
+    # a negative d_max gave the discharge variable an empty domain and the request came back
+    # as a bare Infeasible, see evcc-io/optimizer#209
+    payload['batteries'][0][field] = -1700
+
+    response = app.test_client().post('/optimize/charge-schedule', json=payload)
+
+    assert response.status_code == 400
+    assert list(response.json['details']) == [f'batteries.0.{field}']
+    assert json.loads(capsys.readouterr().out)['bad_request']['validator'] == 'minimum'
+
+
+def test_c_min_above_c_max_is_rejected(payload):
+    payload['batteries'][0]['c_min'] = 6000
+
+    response = app.test_client().post('/optimize/charge-schedule', json=payload)
+
+    assert response.status_code == 400
+    assert response.json == {
+        'message': 'Minimum charge power must not exceed maximum charge power',
+        'details': {'batteries.0.c_min': '6000 exceeds c_max 5000'},
+    }
+
+
+def test_s_initial_above_capacity_is_rejected(payload):
+    # s is bounded by s_capacity, so a start above it has no feasible state
+    payload['batteries'][0]['s_initial'] = 12000
+
+    response = app.test_client().post('/optimize/charge-schedule', json=payload)
+
+    assert response.status_code == 400
+    assert response.json == {
+        'message': 'Initial state of charge must not exceed capacity',
+        'details': {'batteries.0.s_initial': '12000 exceeds s_capacity 10000'},
+    }
+
+
+def test_conversion_error_logs_omit_exception_values(payload, monkeypatch, capsys):
+    def invalid_battery(**kwargs):
+        raise ValueError('private-exception-value')
+
+    monkeypatch.setattr('optimizer.app.BatteryConfig', invalid_battery)
+
+    response = app.test_client().post('/optimize/charge-schedule', json=payload)
+
+    assert response.status_code == 400
+    logged = capsys.readouterr().out
+    assert 'private-exception-value' not in logged
+    assert json.loads(logged)['bad_request']['reason'] == 'Invalid data format'
+
+
+def test_other_statuses_do_not_log_bad_requests(payload, monkeypatch, capsys):
+    response = app.test_client().post('/optimize/charge-schedule', json=payload)
+    assert response.status_code == 200
+    assert 'bad_request' not in capsys.readouterr().out
+
+    monkeypatch.setenv('JWT_TOKEN_SECRET', 'test-secret')
+    response = app.test_client().post('/optimize/charge-schedule', json={})
+    assert response.status_code == 401
+    assert 'bad_request' not in capsys.readouterr().out
