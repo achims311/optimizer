@@ -253,7 +253,7 @@ class Optimizer:
     """
 
     def __init__(self, strategy: OptimizationStrategy, grid: GridConfig, batteries: List[BatteryConfig], time_series: TimeSeriesData,
-                 eta_c: float = 0.89, eta_d: float = 0.95, M: float = 1e6, optimizer_settings: OptimizerSettings | None = None):
+                 eta_c: float = 0.95, eta_d: float = 0.95, M: float = 1e6, optimizer_settings: OptimizerSettings | None = None):
         """
         Optimizer Constructor
         """
@@ -470,13 +470,14 @@ class Optimizer:
             else:
                 self.variables['z_c'][i] = None
 
-        # Binary variable to lock charging against discharging
+        # Binary variable to lock charging against discharging. A battery that can do neither has
+        # nothing to lock, and a gate left in no row comes back from the solver without a value
         self.variables['z_cd'] = {}
         for i, bat in enumerate(self.batteries):
             self.variables['z_cd'][i] = [
                 self.problem.add_variable(f"z_cd_{i}_{t}", cat='Binary')
                 for t in self.time_steps
-            ]
+            ] if bat.c_max > 0 or bat.d_max > 0 else [0] * self.T
 
     def _setup_target_function(self):
         """
@@ -1438,10 +1439,8 @@ class Optimizer:
 
         # charge for import power demand rate. The demand rate is applied to the maximum
         # power draw beyond the threshold within the time horizon.
-        p_max_imp_exc = None
         if self.is_grid_demand_rate_active:
-            p_max_imp_exc = pulp.value(self.variables['p_max_imp_exc'])
-        if p_max_imp_exc is not None:
-            clean_objective += - self.grid.prc_p_exc_imp * p_max_imp_exc
+            clean_objective += - self.grid.prc_p_exc_imp \
+                * pulp.value(self.variables['p_max_imp_exc'])
 
         return clean_objective
